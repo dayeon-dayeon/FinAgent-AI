@@ -16,3 +16,16 @@
 
 
 
+## 3. 시스템 아키텍처 
+
+
+## 4. 기술 스택
+
+## 5. 프로젝트 구조
+<img width="319" height="371" alt="image" src="https://github.com/user-attachments/assets/7733985b-d91f-479a-ab26-ef5a6884970c" />
+
+
+
+
+
+## 실행 방법
