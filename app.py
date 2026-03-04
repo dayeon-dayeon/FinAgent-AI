@@ -5,10 +5,10 @@ import requests
 st.set_page_config(page_title="FinAgent-AI", page_icon="📈", layout="wide")
 
 st.title("📈 AI 주가 분석 & 포트폴리오 에이전트 📈")
-st.markdown("관심 있는 기업이나 최근 경제 이슈에 대해 질문해 보세요. 수집가, 분석가, 매니저 3명의 AI 에이전트가 데이터를 분석하여 투자 전략을 제시합니다.")
+st.markdown("3명의 AI 에이전트가 데이터를 분석하여 투자 전략을 제시합니다.")
 
 # 사용자 입력 창
-query = st.text_input("질문을 입력해주세요 (ex : SK하이닉스의 1개월치 주가 데이터와 최근 이슈 분석해)")
+query = st.text_input("관심 있는 기업이나 최근 경제 이슈에 대해 질문해 보세요. (ex :  최근 삼성전자 D램 이슈와 주가 전망 알려줘 / SK하이닉스의 1개월치 주가 데이터와 최근 이슈 분석해)")
 
 # 분석 버튼
 if st.button("분석 시작"):
@@ -21,11 +21,11 @@ if st.button("분석 시작"):
                 
                 if response.status_code == 200:
                     data = response.json()
-                    st.subheader("📊 [Agent 1] 데이터 수집가")
+                    st.subheader("🔍 [Agent 1] 데이터 수집가")
                     st.markdown(data["collector"])
                     
                     # 1. 수석 분석가의 리포트 출력
-                    st.subheader("📊 [Agent 2] 수석 분석가 심층 리포트")
+                    st.subheader("📊 [Agent 2] 분석가 심층 리포트")
                     st.markdown(data["analysis"])
                     
                     st.divider() # 구분선
