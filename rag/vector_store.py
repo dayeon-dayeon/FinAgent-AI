@@ -69,7 +69,7 @@ def get_retriever():
     vector_db = FAISS.load_local(DB_PATH, embeddings, allow_dangerous_deserialization=True)
     
     # 검색 시 가장 관련성 높은 3개의 문서를 가져오도록 설정.
-    retriever = vector_db.as_retriever(search_kwargs={"k": 3})
+    retriever = vector_db.as_retriever(search_kwargs={"k": 5})
     return retriever
 
 # 단독으로 이 파일을 실행할 때만 DB를 생성
