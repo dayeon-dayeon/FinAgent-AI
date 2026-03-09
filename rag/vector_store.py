@@ -1,35 +1,96 @@
 import os
-from langchain_community.document_loaders import DirectoryLoader, TextLoader
+import re
+from dotenv import load_dotenv
+from langchain_community.document_loaders import (
+    DirectoryLoader,
+    TextLoader,
+    PyPDFLoader,
+    CSVLoader
+)
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
-#from langchain_openai import AzureOpenAIEmbeddings
+from langchain_openai import AzureOpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 
-# 환경변수 로드를 위해 dotenv 사용 (실행 시 main.py 등에서 호출할 예정)
-from dotenv import load_dotenv
 load_dotenv()
 
-# 상수 정의
-DATA_PATH = "./data"
-DB_PATH = "./faiss_index"
+DATA_PATH = os.getenv("DATA_PATH", "./data")
+INDEX_PATH = os.getenv("INDEX_PATH", "faiss_index")
+APP_ENV = os.getenv("APP_ENV", "dev")
+
+def get_embeddings():
+    """인덱싱과 검색 시 동일한 설정의 AzureOpenAIEmbeddings를 사용합니다."""
+    return AzureOpenAIEmbeddings(
+        api_key=os.getenv("AOAI_API_KEY"),
+        azure_endpoint=os.getenv("AOAI_ENDPOINT"),
+        azure_deployment=os.getenv("AOAI_DEPLOY_EMBED_3_SMALL"),
+        api_version="2024-02-15-preview"
+    )
+
+def _enrich_metadata(documents):
+    """로드된 문서의 파일명에서 날짜(YYMMDD)와 문서 타입을 정확하게 추출해 메타데이터로 주입합니다."""
+    for doc in documents:
+        source = doc.metadata.get("source", "")
+        basename = os.path.basename(source)
+        
+        match = re.search(r"(\d{8}|\d{6})", basename)
+        if match:
+            doc.metadata["date"] = match.group(1)
+        else:
+            doc.metadata["date"] = "unknown"
+            
+        lower_basename = basename.lower()
+        
+        if "report" in lower_basename or "리포트" in lower_basename:
+            doc.metadata["doc_type"] = "report"
+        elif "news" in lower_basename or "뉴스" in lower_basename:
+            doc.metadata["doc_type"] = "news"
+        else:
+            try:
+                parts = lower_basename.split('_')
+                if len(parts) > 1:
+                    extracted_type = parts[1].replace('.txt', '').replace('.pdf', '').replace('.csv', '').strip()
+                    doc.metadata["doc_type"] = extracted_type
+                else:
+                    doc.metadata["doc_type"] = "general"
+            except Exception:
+                doc.metadata["doc_type"] = "general"
+                
+    return documents
 
 def create_vector_db():
-    """
-    data 폴더의 문서들을 읽어 FAISS Vector DB를 생성하고 로컬에 저장합니다.
-    """
-    print("===== 데이터 로딩 시작 =====")
-    # data 폴더 내의 모든 .txt 파일을 로드합니다.
-    loader = DirectoryLoader(DATA_PATH, glob="**/*.txt", loader_cls=TextLoader,loader_kwargs={'encoding': 'utf-8'})
-    documents = loader.load()
+    """다양한 파일 확장자(txt, pdf, csv)를 지원하는 멀티 로더 인덱싱"""
+    print(f"===== 데이터 로딩 시작: {DATA_PATH} =====")
     
+    loaders = {
+        "**/*.txt": TextLoader,
+        "**/*.pdf": PyPDFLoader,
+        "**/*.csv": CSVLoader
+    }
+    
+    documents = []
+    
+    for glob_pattern, loader_cls in loaders.items():
+        try:
+            loader = DirectoryLoader(
+                DATA_PATH, 
+                glob=glob_pattern,
+                loader_cls=loader_cls,
+                loader_kwargs={'autodetect_encoding': True} if loader_cls == TextLoader else {}
+            )
+            loaded_docs = loader.load()
+            if loaded_docs:
+                documents.extend(loaded_docs)
+                print(f"[{glob_pattern}] {len(loaded_docs)}개의 문서 로드 완료.")
+        except Exception as e:
+            print(f"[{glob_pattern}] 로딩 중 에러 발생: {e}")
+
     if not documents:
-        print("읽을 수 있는 텍스트 파일 없음")
+        print("읽을 수 있는 문서가 없습니다. 경로 및 파일 확장자를 확인하세요.")
         return None
 
-    print(f"총 {len(documents)}개의 문서를 로드했습니다.")
+    print(f"\n총 {len(documents)}개의 문서를 로드했습니다.")
+    documents = _enrich_metadata(documents)
 
-    print("===== 텍스트 분할 시작 =====")
-    # 문서를 500자 단위로 자르고, 문맥 유지를 위해 50자씩 overlap 설정합니다.
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=500,
         chunk_overlap=50,
@@ -38,40 +99,31 @@ def create_vector_db():
     chunks = text_splitter.split_documents(documents)
     print(f"문서를 총 {len(chunks)}개의 조각으로 분할했습니다.")
 
-    print("===== 임베딩 및 Vector DB (FAISS) 생성 시작 =====")
-    
-    embeddings = OpenAIEmbeddings()
-    # OpenAI의 임베딩 모델을 사용합니다. (.env의 OPENAI_API_KEY 필요)
-    #embeddings = AzureOpenAIEmbeddings(
-    #    azure_endpoint=os.getenv("AOAI_ENDPOINT"),
-    #    api_key=os.getenv("AOAI_API_KEY"),
-    #    azure_deployment=os.getenv("AOAI_DEPLOY_EMBED_3_SMALL"), # 이미지에 있던 small 모델 기준
-    #    openai_api_version="2024-02-15-preview" # Azure OpenAI 필수 버전 정보 (가장 보편적인 버전)
-    #)
-
+    embeddings = get_embeddings()
     vector_db = FAISS.from_documents(chunks, embeddings)
     
-    # 생성된 DB를 로컬 폴더에 저장.
-    vector_db.save_local(DB_PATH)
-    print(f"FAISS DB가 '{DB_PATH}'에 성공적으로 저장되었습니다!")
+    vector_db.save_local(INDEX_PATH)
+    print(f"FAISS DB가 '{INDEX_PATH}'에 성공적으로 저장되었습니다!")
     
     return vector_db
 
-def get_retriever():
-    """
-    저장된 FAISS DB를 불러와서 Retriever(검색기) 객체를 반환합니다.
-    Agent가 정보를 검색할 때 이 함수를 사용합니다.
-    """
-    if not os.path.exists(DB_PATH):
-        raise FileNotFoundError(f"FAISS DB를 찾을 수 없습니다. 먼저 create_vector_db()를 실행하세요.")
-    
-    embeddings = OpenAIEmbeddings()
-    vector_db = FAISS.load_local(DB_PATH, embeddings, allow_dangerous_deserialization=True)
-    
-    # 검색 시 가장 관련성 높은 3개의 문서를 가져오도록 설정.
-    retriever = vector_db.as_retriever(search_kwargs={"k": 5})
-    return retriever
+class SecurityError(Exception):
+    pass    
 
-# 단독으로 이 파일을 실행할 때만 DB를 생성
+def get_retriever():
+    if not os.path.exists(INDEX_PATH):
+        print("인덱스가 존재하지 않습니다. 새로 생성합니다...")
+        db = create_vector_db()
+        if not db:
+            raise FileNotFoundError("FAISS 인덱스 생성에 실패했습니다.")
+    else:
+        embeddings = get_embeddings()
+        db = FAISS.load_local(
+            INDEX_PATH, 
+            embeddings, 
+            allow_dangerous_deserialization=True
+        )
+    return db.as_retriever(search_kwargs={"k": 10})
+
 if __name__ == "__main__":
     create_vector_db()
