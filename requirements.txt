@@ -1,12 +1,24 @@
-langchain
-langchain-openai
-langgraph
+# Web Framework & UI
 fastapi
 uvicorn
-streamlit
-python-dotenv
-faiss-cpu
-tiktoken
 pydantic
+streamlit
+requests
+
+# AI & LangChain Ecosystem
+langchain
+langchain-core
+langchain-openai
 langchain-community
 langchain-text-splitters
+langgraph
+
+# Data & Utils
+yfinance
+pandas
+faiss-cpu
+python-dotenv
+
+# Multi-format Loaders & Utils
+pypdf
+chardet
