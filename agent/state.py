@@ -1,13 +1,13 @@
-from typing import TypedDict, List
+from typing import Annotated, List, TypedDict, Optional, Union
+from operator import add
 
-class _AgentStateRequired(TypedDict):
+class AgentState(TypedDict, total=False):
     query: str
-    context: list
+    collected_sources: Annotated[List[str], add]
+    context: str
     analysis: str
-    final_result: str
-
-class AgentState(_AgentStateRequired, total=False):
-    """
-    LangGraph에서 에이전트들이 서로 주고받을 데이터 구조.
-    """
-    collected_sources: List[str]  # 수집가가 분석에 사용한 데이터 파일/출처 목록
+    final_result: Union[str, dict]
+    ticker: Optional[str]
+    ticker_detected: bool
+    rag_hit: bool
+    error: Optional[str]

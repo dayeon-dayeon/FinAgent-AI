@@ -18,6 +18,8 @@ yfinance
 pandas
 faiss-cpu
 python-dotenv
+finance-datareader
+duckduckgo-search
 
 # Multi-format Loaders & Utils
 pypdf

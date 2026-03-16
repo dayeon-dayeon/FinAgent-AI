@@ -8,7 +8,8 @@ from langchain_community.document_loaders import (
     CSVLoader
 )
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import AzureOpenAIEmbeddings
+#from langchain_openai import AzureOpenAIEmbeddings
+from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 
 load_dotenv()
@@ -17,14 +18,18 @@ DATA_PATH = os.getenv("DATA_PATH", "./data")
 INDEX_PATH = os.getenv("INDEX_PATH", "faiss_index")
 APP_ENV = os.getenv("APP_ENV", "dev")
 
+#def get_embeddings():
+#    """인덱싱과 검색 시 동일한 설정의 AzureOpenAIEmbeddings를 사용합니다."""
+#    return AzureOpenAIEmbeddings(
+#        api_key=os.getenv("AOAI_API_KEY"),
+#        azure_endpoint=os.getenv("AOAI_ENDPOINT"),
+#        azure_deployment=os.getenv("AOAI_DEPLOY_EMBED_3_SMALL"),
+#        api_version="2024-02-15-preview"
+#    )
+
 def get_embeddings():
-    """인덱싱과 검색 시 동일한 설정의 AzureOpenAIEmbeddings를 사용합니다."""
-    return AzureOpenAIEmbeddings(
-        api_key=os.getenv("AOAI_API_KEY"),
-        azure_endpoint=os.getenv("AOAI_ENDPOINT"),
-        azure_deployment=os.getenv("AOAI_DEPLOY_EMBED_3_SMALL"),
-        api_version="2024-02-15-preview"
-    )
+    """일반 OpenAI 임베딩을 사용합니다."""
+    return OpenAIEmbeddings(model="text-embedding-3-small")
 
 def _enrich_metadata(documents):
     """로드된 문서의 파일명에서 날짜(YYMMDD)와 문서 타입을 정확하게 추출해 메타데이터로 주입합니다."""
@@ -123,7 +128,7 @@ def get_retriever():
             embeddings, 
             allow_dangerous_deserialization=True
         )
-    return db.as_retriever(search_kwargs={"k": 10})
+    return db.as_retriever(search_kwargs={"k": 5})
 
 if __name__ == "__main__":
     create_vector_db()
