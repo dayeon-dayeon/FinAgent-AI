@@ -41,42 +41,32 @@ if st.button("분석 시작"):
                     st.subheader("🔍 [Agent 1] 데이터 수집가")
                     try:
                         collector_text = data.get("collector", "")
-                        lines = collector_text.split('\n')
-                        
-                        chart_data = []
-                        filtered_lines = []
-                        current_stock = "주가"
-                        is_stock_data = False
+                        st.markdown(collector_text)
 
-                        for line in lines:
-                            # 1. 종목명 텍스트 숨기기
-                            name_match = re.search(r'\[출처:\s*(.*?)_실시간', line)
-                            if name_match:
-                                current_stock = name_match.group(1)
-                                is_stock_data = True
-                                continue 
-                            
-                            # 2. 주가 데이터 텍스트 숨기고 차트용 데이터로만 빼내기
-                            price_match = re.search(r'- (\d{4}-\d{2}-\d{2}): 종가 (\d+)', line)
-                            if price_match:
-                                date_str = price_match.group(1)
-                                price = int(price_match.group(2))
-                                chart_data.append({"날짜": date_str, "종목": current_stock, "종가": price})
-                                continue 
-                            
-                            # 3. 주가 데이터가 끝난 직후의 쓸데없는 빈 줄 숨기기
-                            if is_stock_data and line.strip() == "":
-                                is_stock_data = False
-                                continue
-                            
-                            # 위 조건에 안 걸린 텍스트(뉴스, RAG 문서 등)만 화면에 남기기
-                            filtered_lines.append(line)
+                        chart_data = list(data.get("stock_chart") or [])
+                        if not chart_data and collector_text:
+                            lines = collector_text.split("\n")
+                            current_stock = "주가"
                             is_stock_data = False
+                            for line in lines:
+                                name_match = re.search(r"\[출처:\s*(.*?)_실시간", line)
+                                if name_match:
+                                    current_stock = name_match.group(1)
+                                    is_stock_data = True
+                                    continue
+                                price_match = re.search(r"- (\d{4}-\d{2}-\d{2}): 종가 (\d+)", line)
+                                if price_match:
+                                    chart_data.append(
+                                        {
+                                            "날짜": price_match.group(1),
+                                            "종목": current_stock,
+                                            "종가": int(price_match.group(2)),
+                                        }
+                                    )
+                                    continue
+                                if is_stock_data and line.strip() == "":
+                                    is_stock_data = False
 
-                        # 필터링된 진짜 텍스트(뉴스 등)만 먼저 예쁘게 출력
-                        st.markdown('\n'.join(filtered_lines))
-                        
-                        # 주가 데이터가 존재하면 동적 스케일이 적용된 그래프 출력
                         if chart_data:
                             df_chart = pd.DataFrame(chart_data)
                             
@@ -87,7 +77,7 @@ if st.button("분석 시작"):
                                 color=alt.Color('종목:N', title='종목'),
                                 tooltip=['날짜:T', '종목:N', '종가:Q'] # 마우스 올리면 상세 정보 표시
                             ).properties(
-                                title="📈 실시간 1개월 주가 추이",
+                                title="📈 실시간 주가 추이 (Yahoo Finance · 기간은 수집 출처의 기간= 참고)",
                                 height=400
                             ).interactive() # 마우스 휠로 확대/축소 가능
                             

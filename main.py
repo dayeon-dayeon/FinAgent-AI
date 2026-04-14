@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 import json
 
 app = FastAPI()
@@ -25,6 +25,7 @@ class AnalysisResponse(BaseModel):
     collector: str
     analysis: str
     strategy: Dict[str, Any]
+    stock_chart: Optional[List[Dict[str, Any]]] = None
 
 
 def _normalize_strategy_keys(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -67,10 +68,19 @@ async def analyze(request: QueryRequest):
                 "💡 시기적 심리 변수 (주의사항)": final_result_str,
             }
 
+        collector_ui = result.get("collector_display")
+        if not collector_ui:
+            collector_ui = (
+                "## 수집 요약\n- UI용 요약을 불러오지 못했습니다. "
+                "백엔드를 최신 코드로 재시작했는지 확인하세요."
+            )
+        stock_chart = result.get("stock_chart")
+
         return AnalysisResponse(
-            collector=context_data,
+            collector=collector_ui,
             analysis=analysis_data,
             strategy=strategy_json,
+            stock_chart=stock_chart if stock_chart else None,
         )
 
     except HTTPException:

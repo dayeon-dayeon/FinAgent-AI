@@ -2,6 +2,8 @@ import os
 import re
 from datetime import datetime, date
 import functools
+from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import yfinance as yf
@@ -14,6 +16,9 @@ from langchain_community.tools import DuckDuckGoSearchResults
 from agent.prompts import ANALYST_PROMPT, MANAGER_PROMPT
 from agent.state import AgentState
 from rag.vector_store import get_retriever
+
+KST = ZoneInfo("Asia/Seoul")
+_MAX_NEWS_INJECT_CHARS = 120_000
 
 #aoai_api_key = os.getenv("AOAI_API_KEY")
 #aoai_endpoint = os.getenv("AOAI_ENDPOINT")
@@ -68,46 +73,108 @@ def get_stock_mapping():
     mapping.update(us_stocks)
     return mapping
 
-def _detect_tickers(query: str):
-    """질문에서 종목명을 찾아 티커를 반환합니다."""
+def _detect_tickers(query: str) -> dict[str, str]:
+    """질문에서 종목명(한글) 또는 미국식 티커(영문 대문자)를 찾아 Yahoo Finance 심볼로 매핑합니다. 동일 티커는 한 번만."""
     mapping = get_stock_mapping()
-    found_tickers = {}
-    
-    sorted_names = sorted(mapping.keys(), key=len, reverse=True)
+    found_tickers: dict[str, str] = {}
+    used_symbols: set[str] = set()
 
+    sorted_names = sorted(mapping.keys(), key=len, reverse=True)
     search_query = query
     for name in sorted_names:
         if len(name) > 1 and name in search_query:
-            found_tickers[name] = mapping[name]
+            sym = mapping[name]
+            if sym not in used_symbols:
+                found_tickers[name] = sym
+                used_symbols.add(sym)
             search_query = search_query.replace(name, "")
-            
-            if len(found_tickers) >= 3:
-                break
+            if len(found_tickers) >= 5:
+                return found_tickers
+
+    q_upper = query.upper()
+    for name, ticker in mapping.items():
+        if not isinstance(ticker, str) or not re.fullmatch(r"[A-Z]{1,5}", ticker):
+            continue
+        if ticker in used_symbols:
+            continue
+        if re.search(rf"\b{re.escape(ticker)}\b", q_upper):
+            found_tickers[name] = ticker
+            used_symbols.add(ticker)
+        if len(found_tickers) >= 5:
+            break
 
     return found_tickers
 
-def fetch_stock_data(query: str) -> str:
-    """사용자 질문에서 종목을 찾아 최근 1달 치 주가를 텍스트로 반환합니다."""
+
+def _query_tokens(query: str) -> list[str]:
+    """질문에서 길이 2 이상 토큰만 추출(한글·영문·숫자 혼합 단어)."""
+    return [t for t in re.findall(r"[\w가-힣]{2,}", query) if len(t) >= 2]
+
+
+def _text_matches_query_or_tickers(
+    text: str,
+    query: str,
+    detected_tickers: dict[str, str],
+) -> bool:
+    """질문 키워드 또는 감지된 종목명/티커가 본문에 드러나는지 검사합니다."""
+    if not text.strip():
+        return False
+    for name in detected_tickers.keys():
+        if name in text:
+            return True
+    for sym in detected_tickers.values():
+        if isinstance(sym, str) and re.fullmatch(r"[A-Z]{1,5}", sym):
+            if re.search(rf"\b{re.escape(sym)}\b", text.upper()):
+                return True
+    tokens = _query_tokens(query)
+    if not tokens:
+        return True
+    hits = sum(1 for t in tokens if t in text)
+    return hits >= max(1, min(2, len(tokens) // 3 + 1))
+
+
+def _filter_daily_news_by_query(ntext: str, query: str, detected_tickers: dict[str, str]) -> str:
+    """일일 뉴스 파일에서 질문과 무관한 `[n] ...` 기사 블록을 제거합니다."""
+    parts = re.split(r"\n(?=\[\d+\]\s)", ntext)
+    if len(parts) <= 1:
+        return ntext if _text_matches_query_or_tickers(ntext, query, detected_tickers) else ""
+    header = parts[0].rstrip()
+    kept_blocks: list[str] = []
+    for block in parts[1:]:
+        if _text_matches_query_or_tickers(block, query, detected_tickers):
+            kept_blocks.append(block)
+    if not kept_blocks:
+        return ""
+    return header + "\n\n" + "\n\n".join(kept_blocks)
+
+
+def fetch_stock_data(query: str) -> tuple[str, list[dict[str, Any]]]:
+    """질문에서 종목을 찾아 Yahoo Finance 주가 텍스트와 차트용 행 목록을 반환합니다."""
     stock_info = ""
+    chart_rows: list[dict[str, Any]] = []
     found_tickers = _detect_tickers(query)
+    period = (os.getenv("STOCK_CHART_PERIOD") or "1mo").strip() or "1mo"
 
     for name, ticker in found_tickers.items():
         try:
-            print(f"▶ [외부 API 연동] '{name}'의 최근 1개월 주가 데이터를 실시간으로 다운로드합니다...")
+            print(f"▶ [외부 API 연동] '{name}'의 최근 주가 데이터(period={period})를 다운로드합니다...")
             ticker_obj = yf.Ticker(ticker)
-            df = ticker_obj.history(period="1mo")
-            
+            df = ticker_obj.history(period=period)
+
             if not df.empty:
-                stock_info += f"[출처: {name}_실시간_1개월_주가데이터(Yahoo_Finance)]\n"
+                stock_info += (
+                    f"[출처: {name}_실시간_주가데이터(Yahoo_Finance) 기간={period} 분석기준일={datetime.now().strftime('%Y-%m-%d')}]\n"
+                )
                 for idx, row in df.iterrows():
                     date_str = pd.to_datetime(str(idx)).strftime("%Y-%m-%d")
-                    price_val = float(row['Close'])
+                    price_val = float(row["Close"])
                     stock_info += f"- {date_str}: 종가 {price_val:.0f}\n"
+                    chart_rows.append({"날짜": date_str, "종목": name, "종가": int(round(price_val))})
                 stock_info += "\n"
         except Exception as e:
             print(f"주가 다운로드 실패 ({name}): {e}")
 
-    return stock_info
+    return stock_info, chart_rows
 
 def fetch_web_search(query: str) -> str:
     """질문을 기반으로 DuckDuckGo 실시간 웹 검색을 수행합니다."""
@@ -120,6 +187,28 @@ def fetch_web_search(query: str) -> str:
     except Exception as e:
         print(f"웹 검색 실패: {e}")
     return ""
+
+def _data_dir() -> str:
+    return os.path.normpath(os.getenv("DATA_PATH", "./data"))
+
+
+def _read_todays_news_file() -> tuple[str, str] | None:
+    """KST 기준 오늘 날짜의 data/news_YYYYMMDD.txt 가 있으면 (절대경로, 본문) 반환."""
+    tag = datetime.now(KST).strftime("%Y%m%d")
+    path = os.path.join(_data_dir(), f"news_{tag}.txt")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError as e:
+        print(f"일일 뉴스 파일 읽기 실패 ({path}): {e}")
+        return None
+    ap = os.path.abspath(path)
+    if len(text) > _MAX_NEWS_INJECT_CHARS:
+        text = text[:_MAX_NEWS_INJECT_CHARS] + "\n...(이하 생략)"
+    return (ap, text.strip())
+
 
 def _parse_date_from_source(source: str) -> date | None:
     basename = os.path.basename(source)
@@ -136,69 +225,132 @@ def _parse_date_from_source(source: str) -> date | None:
 
 def collector_node(state: AgentState) -> AgentState:
     print("[Agent 1] 금융 정보 수집가")
-    print("문서, 실시간 데이터 및 최신 웹 뉴스를 수집 중...")
+    print("주가·오늘자 뉴스 파일 또는 문서 검색·웹을 조합해 수집합니다...")
 
+    q = state["query"]
     context_list: list[str] = []
     collected_sources: list[str] = []
+    summary_lines: list[str] = []
 
-    detected_tickers = _detect_tickers(state["query"])
+    detected_tickers = _detect_tickers(q)
     ticker_detected = bool(detected_tickers)
 
     rag_hit = False
+    rag_kept = 0
+    stock_chart: list[dict[str, Any]] = []
 
-    try:
-        retriever = get_retriever()
-        docs = retriever.invoke(state["query"])
-        if docs:
-            rag_hit = True
-
-            scored_docs = []
-            for doc in docs:
-                source_file = doc.metadata.get("source", "알 수 없는 파일")
-                doc_date = _parse_date_from_source(source_file)
-                content = doc.page_content.strip()
-                
-                ticker_score = 0
-                if detected_tickers:
-                    for name in detected_tickers.keys():
-                        if name in content or name in source_file:
-                            ticker_score += 1
-                    if ticker_score == 0:
-                        continue 
-
-                scored_docs.append((ticker_score, doc_date, source_file, doc, content))
-
-            def sort_key(item):
-                t_score, d_date, _, _, _ = item
-                return (t_score, d_date is not None, d_date or date.min)
-
-            scored_docs.sort(key=sort_key, reverse=True)
-
-            seen_contents = set()
-            for _, _, source_file, doc, content in scored_docs:
-                if not content or content in seen_contents:
-                    continue
-                seen_contents.add(content)
-
-                context_list.append(f"[출처: {source_file}]\n{content}")
-                if source_file not in collected_sources:
-                    collected_sources.append(source_file)
-    except Exception as e:
-        print(f"RAG 검색 중 오류 발생: {e}")
-
-    live_stock_data = fetch_stock_data(state["query"])
+    # 1) 질문에 나온 종목 주가를 최우선으로 수집·배치 (가격·기간은 헤더에 명시됨)
+    live_stock_data, stock_chart = fetch_stock_data(q)
     if live_stock_data:
         context_list.append(live_stock_data)
         collected_sources.append("실시간 주가 데이터 (Yahoo Finance)")
+        names = sorted({r["종목"] for r in stock_chart})
+        if names:
+            summary_lines.append(f"- **주가 수집**: {', '.join(names)} (Yahoo Finance)")
 
-    web_search_data = fetch_web_search(state["query"])
+    today_news_basename: str | None = None
+    use_todays_news_file_only = False
+    injected = _read_todays_news_file()
+    if injected:
+        npath, ntext = injected
+        today_news_basename = os.path.basename(npath)
+        if ntext.strip():
+            filtered_news = _filter_daily_news_by_query(ntext, q, detected_tickers)
+            news_body = filtered_news.strip() if filtered_news.strip() else ntext.strip()
+            print(f"▶ [일일 뉴스] {today_news_basename} — 본 분석의 뉴스 근거로 사용 (RAG·웹 검색 생략)")
+            context_list.append(f"[출처: {npath}]\n{news_body}")
+            collected_sources.append(npath)
+            summary_lines.append(
+                f"- **일일 뉴스**: `{today_news_basename}`"
+            )
+            use_todays_news_file_only = True
+
+    if not use_todays_news_file_only:
+        try:
+            retriever = get_retriever()
+            docs = retriever.invoke(q)
+            if docs:
+                rag_hit = True
+
+                scored_docs = []
+                for doc in docs:
+                    source_file = doc.metadata.get("source", "알 수 없는 파일")
+                    if today_news_basename and os.path.basename(source_file) == today_news_basename:
+                        continue
+
+                    doc_date = _parse_date_from_source(source_file)
+                    content = doc.page_content.strip()
+                    base_name = os.path.basename(source_file)
+                    is_daily_news_doc = doc.metadata.get("doc_type") == "news" or base_name.lower().startswith(
+                        "news_"
+                    )
+
+                    ticker_score = 0
+                    if detected_tickers:
+                        for name in detected_tickers.keys():
+                            if name in content or name in source_file:
+                                ticker_score += 1
+
+                    if ticker_score == 0:
+                        if is_daily_news_doc:
+                            if not _text_matches_query_or_tickers(content, q, detected_tickers):
+                                continue
+                        else:
+                            if not _text_matches_query_or_tickers(content, q, detected_tickers):
+                                continue
+
+                    scored_docs.append((ticker_score, doc_date, source_file, doc, content))
+
+                def sort_key(item):
+                    t_score, d_date, _, _, _ = item
+                    return (t_score, d_date is not None, d_date or date.min)
+
+                scored_docs.sort(key=sort_key, reverse=True)
+
+                scored_docs.sort(
+                    key=lambda it: (
+                        -it[0],
+                        it[1] is None,
+                        it[1] or date.max,
+                    )
+                )
+
+                seen_contents = set()
+                for _, _, source_file, doc, content in scored_docs:
+                    if not content or content in seen_contents:
+                        continue
+                    seen_contents.add(content)
+
+                    context_list.append(f"[출처: {source_file}]\n{content}")
+                    rag_kept += 1
+                    if source_file not in collected_sources:
+                        collected_sources.append(source_file)
+        except Exception as e:
+            print(f"RAG 검색 중 오류 발생: {e}")
+
+    web_search_data = ""
+    if not use_todays_news_file_only:
+        web_search_data = fetch_web_search(q)
     if web_search_data:
-        context_list.append(web_search_data)
-        collected_sources.append("실시간 웹 검색 (DuckDuckGo)")
+        body = web_search_data
+        if web_search_data.startswith("[출처:"):
+            nl = web_search_data.find("\n")
+            body = web_search_data[nl + 1 :] if nl != -1 else ""
+        if _text_matches_query_or_tickers(body, q, detected_tickers):
+            context_list.append(web_search_data)
+            collected_sources.append("실시간 웹 검색 (DuckDuckGo)")
+            summary_lines.append("- **웹 검색**: 질문과 연관된 스니펫만 분석에 사용")
+        else:
+            print("▶ [웹 검색] 질문과의 연관성이 낮아 결과를 생략합니다.")
+
+    if rag_kept:
+        summary_lines.append(f"- **문서 검색(RAG)**: 연관 청크 {rag_kept}건")
 
     if not context_list:
         return {
             "context": "데이터 없음",
+            "collector_display": "수집된 근거가 없습니다.",
+            "stock_chart": [],
             "collected_sources": [],
             "ticker": None,
             "ticker_detected": ticker_detected,
@@ -209,8 +361,12 @@ def collector_node(state: AgentState) -> AgentState:
     joined_context = "\n\n---\n\n".join(context_list)
     first_ticker = next(iter(detected_tickers.keys()), None) if detected_tickers else None
 
+    display_md = "## 수집 요약\n" + "\n".join(summary_lines) if summary_lines else "## 수집 요약\n- (표시할 항목 없음)"
+
     return {
         "context": joined_context,
+        "collector_display": display_md,
+        "stock_chart": stock_chart,
         "collected_sources": collected_sources,
         "ticker": first_ticker,
         "ticker_detected": ticker_detected,
@@ -236,8 +392,19 @@ def analyst_node(state: AgentState) -> AgentState:
 
 def manager_node(state: AgentState) -> AgentState:
     print("[Agent 3] 포트폴리오 매니저")
-    print("분석 결과를 바탕으로 최종 투자 전략 수립 중...")
+    print("수집 컨텍스트(뉴스 등)와 분석가 리포트를 대조해 최종 투자 전략 수립 중...")
+    today_date = datetime.now().strftime("%Y년 %m월 %d일")
     prompt = PromptTemplate.from_template(MANAGER_PROMPT)
     chain = prompt | json_llm
-    response = chain.invoke({"analysis": state["analysis"]})
+    ctx = state.get("context") or ""
+    # 토큰 과다 방지: 매니저는 요약 판단용이므로 상한(대략 24k자)만 둠
+    if len(ctx) > 24000:
+        ctx = ctx[:23900] + "\n\n[… 이하 원문 컨텍스트 생략 …]"
+    response = chain.invoke(
+        {
+            "analysis": state["analysis"],
+            "context": ctx,
+            "current_date": today_date,
+        }
+    )
     return {"final_result": response.content}
