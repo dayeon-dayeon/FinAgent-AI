@@ -1,51 +1,200 @@
-import sys
+"""
+FinAgent-AI 통합 실행 스크립트.
+
+기본 실행 (처음 세팅 ~ 서비스 기동까지 한 번에):
+    python run.py
+
+단계:
+  1) pip install -r requirements.txt
+  2) python -m rag.economic_news  (오늘자 data/news_YYYYMMDD.txt 수집)
+  3) python -m rag.vector_store   (data/ 기반 FAISS 인덱스 생성)
+  4) FastAPI(8000) + Streamlit(8501) 동시 기동
+
+서버만 빠르게 켤 때 (이미 패키지·뉴스·인덱스가 준비된 경우):
+    python run.py --serve-only
+
+일부 단계만 건너뛰기:
+    python run.py --no-pip
+    python run.py --no-news
+    python run.py --no-faiss
+
+가상환경 사용 시 프로젝트 루트에서 venv 활성화 후 실행하는 것을 권장합니다.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.util
 import subprocess
+import sys
 import time
 import webbrowser
-import importlib.util
+from pathlib import Path
 
-def main():
-    print("🚀 FinAgent-AI 서버 통합 실행을 시작합니다...\n")
-    
-    # [스마트 체크] 현재 실행 중인 파이썬이 streamlit을 가지고 있는지 확인합니다.
+ROOT = Path(__file__).resolve().parent
+REQUIREMENTS = ROOT / "requirements.txt"
+
+
+def _run_step(
+    title: str,
+    argv: list[str],
+    *,
+    cwd: Path | None = None,
+    optional: bool = False,
+) -> bool:
+    """서브프로세스 실행. optional=True면 실패해도 False만 반환하고 예외 없이 진행."""
+    print("\n" + "=" * 60)
+    print(title)
+    print("=" * 60)
+    cmd = " ".join(argv)
+    print(f"$ {cmd}\n")
+    try:
+        r = subprocess.run(
+            argv,
+            cwd=cwd or ROOT,
+            check=False,
+        )
+    except OSError as e:
+        print(f"[오류] 실행 실패: {e}")
+        return False
+    if r.returncode != 0:
+        msg = f"명령이 종료 코드 {r.returncode} 로 끝났습니다."
+        if optional:
+            print(f"[경고] {msg} (선택 단계이므로 계속합니다.)")
+            return False
+        print(f"[오류] {msg}")
+        return False
+    print("[완료]")
+    return True
+
+
+def step_pip_install() -> bool:
+    if not REQUIREMENTS.is_file():
+        print(f"[오류] {REQUIREMENTS} 파일이 없습니다.")
+        return False
+    return _run_step(
+        "[1/4] 필수 패키지 설치 (pip install -r requirements.txt)",
+        [sys.executable, "-m", "pip", "install", "-r", str(REQUIREMENTS)],
+    )
+
+
+def step_economic_news() -> bool:
+    return _run_step(
+        "[2/4] 오늘의 경제·증시 뉴스 수집 (python -m rag.economic_news)",
+        [sys.executable, "-m", "rag.economic_news"],
+        optional=True,
+    )
+
+
+def step_faiss() -> bool:
+    return _run_step(
+        "[3/4] Vector DB(FAISS) 초기화 (python -m rag.vector_store)",
+        [sys.executable, "-m", "rag.vector_store"],
+        optional=True,
+    )
+
+
+def ensure_streamlit() -> bool:
     if importlib.util.find_spec("streamlit") is None:
-        print("🛑 [경고] 현재 파이썬 환경에 'streamlit'이 설치되어 있지 않습니다!")
-        print("아마도 가상환경(venv)이 켜지지 않은 상태인 것 같습니다.")
-        print("-" * 50)
-        print("👉 해결 방법: 터미널에 아래 명령어를 먼저 입력하여 가상환경을 켜주세요.")
-        print("    venv\\Scripts\\activate")
-        print("    (입력 줄 맨 앞에 '(venv)'가 생겼는지 확인 후 다시 python run.py 실행)\n")
-        return
-    
-    # 현재 활성화된(가상환경의) 파이썬 엔진을 그대로 사용합니다.
+        print(
+            "\n[경고] 현재 파이썬 환경에 'streamlit'이 없습니다.\n"
+            "가상환경을 활성화했는지 확인하거나, 아래를 먼저 실행하세요.\n"
+            f"  {sys.executable} -m pip install -r requirements.txt\n"
+        )
+        return False
+    return True
+
+
+def run_servers() -> None:
+    print("\n" + "=" * 60)
+    print("[4/4] 백엔드(FastAPI) + 프론트엔드(Streamlit) 기동")
+    print("=" * 60)
+
+    if not ensure_streamlit():
+        sys.exit(1)
+
     python_exe = sys.executable
-    
-    # 1. 백엔드 실행 (FastAPI)
-    print("[1/2] 백엔드(FastAPI) 시작 중...")
-    backend_process = subprocess.Popen([python_exe, "-m", "uvicorn", "main:app", "--reload", "--port", "8000"])
-    
-    time.sleep(3) # 백엔드가 켜질 시간 대기
-    
-    # 2. 프론트엔드 실행 (Streamlit)
-    print("[2/2] 프론트엔드(Streamlit) 시작 중...")
-    frontend_process = subprocess.Popen([python_exe, "-m", "streamlit", "run", "app.py"])
-    
-    time.sleep(2) # 프론트엔드 대기
-    print("\n✅ 서버 구동 완료! 브라우저를 엽니다...")
+    print("[4a] 백엔드(FastAPI) 시작 중... (port 8000)")
+    backend_process = subprocess.Popen(
+        [python_exe, "-m", "uvicorn", "main:app", "--reload", "--port", "8000"],
+        cwd=ROOT,
+    )
+
+    time.sleep(3)
+
+    print("[4b] 프론트엔드(Streamlit) 시작 중... (port 8501)")
+    # Streamlit 기본 동작도 브라우저를 열므로, headless로 두고 아래에서 한 번만 연다.
+    frontend_process = subprocess.Popen(
+        [
+            python_exe,
+            "-m",
+            "streamlit",
+            "run",
+            "app.py",
+            "--server.headless=true",
+        ],
+        cwd=ROOT,
+    )
+
+    time.sleep(2)
+    print("\n서버 구동 완료. 브라우저를 엽니다... (Streamlit: http://localhost:8501 )")
     webbrowser.open("http://localhost:8501")
-    
-    print("\n💡 서버를 종료하시려면 이 터미널 창에서 'Ctrl + C'를 누르세요.\n")
-    print("-" * 50)
-    
-    # 터미널 유지
+
+    print("\n종료: 이 터미널에서 Ctrl+C")
+    print("-" * 60)
+
     try:
         backend_process.wait()
         frontend_process.wait()
     except KeyboardInterrupt:
-        print("\n\n🛑 종료 명령(Ctrl+C)이 입력되었습니다. 서버를 안전하게 종료합니다...")
+        print("\n\n종료 명령(Ctrl+C) — 서버를 종료합니다...")
         backend_process.terminate()
         frontend_process.terminate()
-        print("서버가 종료되었습니다. 안녕히 가세요!")
+        print("종료되었습니다.")
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="패키지 설치 → 뉴스 수집 → FAISS 초기화 → 서버 기동까지 한 번에 실행합니다.",
+    )
+    p.add_argument(
+        "--serve-only",
+        action="store_true",
+        help="서버만 실행합니다 (pip / 뉴스 / FAISS 단계 생략).",
+    )
+    p.add_argument("--no-pip", action="store_true", help="pip 설치 단계를 건너뜁니다.")
+    p.add_argument("--no-news", action="store_true", help="뉴스 수집 단계를 건너뜁니다.")
+    p.add_argument("--no-faiss", action="store_true", help="FAISS 초기화 단계를 건너뜁니다.")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    print("FinAgent-AI 통합 실행\n프로젝트 루트:", ROOT)
+
+    if args.serve_only:
+        run_servers()
+        return
+
+    ok = True
+    if not args.no_pip:
+        ok = step_pip_install()
+        if not ok:
+            sys.exit(1)
+    else:
+        print("\n[건너뜀] pip 설치 (--no-pip)")
+
+    if not args.no_news:
+        step_economic_news()
+    else:
+        print("\n[건너뜀] 뉴스 수집 (--no-news)")
+
+    if not args.no_faiss:
+        step_faiss()
+    else:
+        print("\n[건너뜀] FAISS 초기화 (--no-faiss)")
+
+    run_servers()
+
 
 if __name__ == "__main__":
     main()

@@ -46,13 +46,34 @@ async def analyze(request: QueryRequest):
         inputs = {"query": request.query}
         result = await graph.ainvoke(inputs)
 
-        # Collector 단계에서 설정된 에러를 명시적으로 처리 (데이터 부족 등)
-        if result.get("error"):
-            raise HTTPException(status_code=422, detail=result["error"])
-
         context_data = result.get("context", "수집된 데이터가 없습니다.")
         analysis_data = result.get("analysis", "분석 결과가 없습니다.")
         final_result_str = result.get("final_result", "{}")
+        stock_chart = result.get("stock_chart") or []
+        collector_ui = result.get("collector_display")
+        if not collector_ui:
+            collector_ui = (
+                "## 수집 요약\n- UI용 요약을 불러오지 못했습니다. "
+                "백엔드를 최신 코드로 재시작했는지 확인하세요."
+            )
+
+        # Collector 단계에서 설정된 에러 처리:
+        # - 원문 근거가 부족해도 stock_chart(주가)가 있으면, UI에서 그래프는 보여줄 수 있도록 200으로 반환
+        err = result.get("error")
+        if err:
+            if stock_chart:
+                return AnalysisResponse(
+                    collector=collector_ui,
+                    analysis=f"데이터가 부족해 예측/전략 수립이 어렵습니다. 사유: {err}",
+                    strategy={
+                        "투자의견": "분석 불가",
+                        "권장 비중": "0%",
+                        "결정 사유": f"원문 뉴스/문서 근거가 부족합니다. ({err})",
+                        "💡 시기적 심리 변수 (주의사항)": "해당 없음",
+                    },
+                    stock_chart=stock_chart,
+                )
+            raise HTTPException(status_code=422, detail=err)
 
         try:
             strategy_raw = json.loads(final_result_str)
@@ -67,14 +88,6 @@ async def analyze(request: QueryRequest):
                 "결정 사유": "JSON 파싱 오류가 발생했습니다.",
                 "💡 시기적 심리 변수 (주의사항)": final_result_str,
             }
-
-        collector_ui = result.get("collector_display")
-        if not collector_ui:
-            collector_ui = (
-                "## 수집 요약\n- UI용 요약을 불러오지 못했습니다. "
-                "백엔드를 최신 코드로 재시작했는지 확인하세요."
-            )
-        stock_chart = result.get("stock_chart")
 
         return AnalysisResponse(
             collector=collector_ui,

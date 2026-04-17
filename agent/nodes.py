@@ -1,9 +1,11 @@
 import os
 import re
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import functools
 from typing import Any
 from zoneinfo import ZoneInfo
+import json
+from pathlib import Path
 
 import pandas as pd
 import yfinance as yf
@@ -40,26 +42,80 @@ llm = ChatOpenAI(
 
 json_llm = llm.bind(response_format={"type": "json_object"})
 
+
+def _cache_dir() -> Path:
+    base = Path(os.getenv("DATA_PATH", "./data"))
+    return base / ".cache"
+
+
+def _krx_ticker_cache_path() -> Path:
+    return _cache_dir() / "krx_tickers.json"
+
+
+def _load_krx_ticker_cache(max_age_hours: int = 24) -> dict[str, str] | None:
+    path = _krx_ticker_cache_path()
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        saved_at = datetime.fromisoformat(raw["saved_at"])
+        if datetime.now(KST) - saved_at.replace(tzinfo=KST) > timedelta(hours=max_age_hours):
+            return None
+        mapping = raw.get("mapping") or {}
+        if isinstance(mapping, dict) and mapping:
+            return {str(k): str(v) for k, v in mapping.items()}
+    except Exception:
+        return None
+    return None
+
+
+def _save_krx_ticker_cache(mapping: dict[str, str]) -> None:
+    try:
+        path = _krx_ticker_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {"saved_at": datetime.now(KST).isoformat(), "count": len(mapping), "mapping": mapping},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
 @functools.lru_cache(maxsize=1)
 def get_stock_mapping():
     """KRX(한국거래소) 전 종목을 불러와 yfinance용 티커(.KS, .KQ)로 변환합니다."""
     print("▶ [초기화] 한국거래소(KRX) 전 종목 데이터를 불러옵니다...")
-    mapping = {}
+    cached = _load_krx_ticker_cache()
+    if cached:
+        mapping = dict(cached)
+    else:
+        mapping: dict[str, str] = {}
     try:
-        # 코스피, 코스닥 전 종목 목록 가져오기
-        df_krx = fdr.StockListing('KRX')
-        for _, row in df_krx.iterrows():
-            code = row['Code']
-            name = row['Name']
-            market = row['Market']
-            
-            # yfinance 형식에 맞게 코스피는 .KS, 코스닥은 .KQ 꼬리표 달기
-            if market == 'KOSPI':
-                mapping[name] = f"{code}.KS"
-            elif market == 'KOSDAQ':
-                mapping[name] = f"{code}.KQ"
-            else:
-                mapping[name] = f"{code}.KS"
+        if not mapping:
+            # KRX 전체가 실패/지연하는 환경이 있어 KOSPI/KOSDAQ로 fallback
+            try:
+                df_krx = fdr.StockListing("KRX")
+                frames = [df_krx]
+            except Exception:
+                frames = [fdr.StockListing("KOSPI"), fdr.StockListing("KOSDAQ")]
+
+            for df in frames:
+                for _, row in df.iterrows():
+                    code = str(row.get("Code", "")).strip()
+                    name = str(row.get("Name", "")).strip()
+                    market = str(row.get("Market", "")).strip().upper()
+                    if not code or not name:
+                        continue
+                    if market == "KOSDAQ":
+                        mapping[name] = f"{code}.KQ"
+                    else:
+                        mapping[name] = f"{code}.KS"
+
+            if mapping:
+                _save_krx_ticker_cache(mapping)
     except Exception as e:
         print(f"KRX 로딩 실패: {e}")
 
@@ -73,16 +129,22 @@ def get_stock_mapping():
     mapping.update(us_stocks)
     return mapping
 
+
+def _norm_name(s: str) -> str:
+    return re.sub(r"[^0-9A-Za-z가-힣]+", "", (s or "").strip()).lower()
+
+
 def _detect_tickers(query: str) -> dict[str, str]:
     """질문에서 종목명(한글) 또는 미국식 티커(영문 대문자)를 찾아 Yahoo Finance 심볼로 매핑합니다. 동일 티커는 한 번만."""
     mapping = get_stock_mapping()
     found_tickers: dict[str, str] = {}
     used_symbols: set[str] = set()
 
+    q_norm = _norm_name(query)
     sorted_names = sorted(mapping.keys(), key=len, reverse=True)
     search_query = query
     for name in sorted_names:
-        if len(name) > 1 and name in search_query:
+        if len(name) > 1 and (name in search_query or _norm_name(name) in q_norm):
             sym = mapping[name]
             if sym not in used_symbols:
                 found_tickers[name] = sym
@@ -146,6 +208,35 @@ def _filter_daily_news_by_query(ntext: str, query: str, detected_tickers: dict[s
     if not kept_blocks:
         return ""
     return header + "\n\n" + "\n\n".join(kept_blocks)
+
+
+def _is_stock_specific_query(query: str) -> bool:
+    """
+    질문이 '특정 종목/매매/주가'처럼 티커가 반드시 필요한 유형인지 판별합니다.
+    거시/시황/정책 질문처럼 종목이 없어도 답할 수 있는 유형은 False.
+    """
+    q = (query or "").strip()
+    if not q:
+        return False
+    stock_intent_keywords = (
+        "주가",
+        "종가",
+        "차트",
+        "티커",
+        "종목",
+        "매수",
+        "매도",
+        "비중",
+        "목표가",
+        "전망",
+        "실적",
+        "per",
+        "pbr",
+        "eps",
+        "배당",
+    )
+    q_lower = q.lower()
+    return any(k in q for k in stock_intent_keywords) or any(k in q_lower for k in ("per", "pbr", "eps"))
 
 
 def fetch_stock_data(query: str) -> tuple[str, list[dict[str, Any]]]:
@@ -234,6 +325,8 @@ def collector_node(state: AgentState) -> AgentState:
 
     detected_tickers = _detect_tickers(q)
     ticker_detected = bool(detected_tickers)
+    stock_specific = _is_stock_specific_query(q)
+    detected_companies = list(detected_tickers.keys())
 
     rag_hit = False
     rag_kept = 0
@@ -367,6 +460,8 @@ def collector_node(state: AgentState) -> AgentState:
         "context": joined_context,
         "collector_display": display_md,
         "stock_chart": stock_chart,
+        "stock_specific": stock_specific,
+        "detected_companies": detected_companies,
         "collected_sources": collected_sources,
         "ticker": first_ticker,
         "ticker_detected": ticker_detected,
@@ -386,6 +481,8 @@ def analyst_node(state: AgentState) -> AgentState:
             "current_date": today_date,
             "ticker_detected": str(state.get("ticker_detected", False)),
             "rag_hit": str(state.get("rag_hit", False)),
+            "stock_specific": str(state.get("stock_specific", False)),
+            "detected_companies": ", ".join(state.get("detected_companies") or []),
         }
     )
     return {"analysis": response.content}
@@ -405,6 +502,7 @@ def manager_node(state: AgentState) -> AgentState:
             "analysis": state["analysis"],
             "context": ctx,
             "current_date": today_date,
+            "detected_companies": ", ".join(state.get("detected_companies") or []),
         }
     )
     return {"final_result": response.content}

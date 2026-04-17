@@ -12,7 +12,7 @@ import os
 import re
 import warnings
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -689,9 +689,10 @@ def build_document_text(
     collected_at_kst: datetime,
     note: str | None = None,
     use_llm_summary: bool = True,
+    document_title: str = "=== 주가·증시 키워드 뉴스 (RSS 수집) ===",
 ) -> str:
     lines: list[str] = [
-        "=== 주가·증시 키워드 뉴스 (RSS 수집) ===",
+        document_title,
         f"수집 시각(KST): {collected_at_kst.strftime('%Y-%m-%d %H:%M:%S')}",
         source_note,
         "키워드 필터: "
@@ -736,6 +737,54 @@ def _article_dedupe_key(it: dict[str, str | None]) -> str:
     if link:
         return link
     return f"title:{_clean_html(str(it.get('title') or ''))}"
+
+
+def _overnight_breaking_window_kst(run_day: date) -> tuple[datetime, datetime]:
+    """장 전 새벽 묶음: 전날 23:00(KST) 이상 ~ 당일 05:00(KST) 미만."""
+    prev = run_day - timedelta(days=1)
+    start = datetime.combine(prev, time(23, 0, 0), tzinfo=KST)
+    end = datetime.combine(run_day, time(5, 0, 0), tzinfo=KST)
+    return start, end
+
+
+def select_overnight_breaking_items(
+    raw_items: list[dict[str, str | None]],
+    *,
+    run_day_kst: date,
+    primary_keywords: tuple[str, ...],
+    max_items: int,
+) -> tuple[list[dict[str, str | None]], str | None]:
+    """
+    전날 23:00~당일 05:00(KST)에 게시되고, 제목·요약에 속보 표기가 있으며
+    primary_keywords에 맞는 기사만 시간순으로 고릅니다.
+    """
+    start, end = _overnight_breaking_window_kst(run_day_kst)
+    picked: list[dict[str, str | None]] = []
+    seen: set[str] = set()
+    for it in raw_items:
+        if not _item_is_breaking(it):
+            continue
+        if not item_matches_keywords(it, primary=primary_keywords):
+            continue
+        dt = _parse_pub_date(it.get("pubDate") if isinstance(it.get("pubDate"), str) else None)
+        if dt is None:
+            continue
+        kst = dt.astimezone(KST)
+        if not (start <= kst < end):
+            continue
+        key = _article_dedupe_key(it)
+        if key in seen:
+            continue
+        seen.add(key)
+        picked.append(it)
+    picked.sort(key=_item_pub_ts)
+    if not picked:
+        return [], None
+    note = (
+        f"선별: KST {start.strftime('%Y-%m-%d %H:%M')} ~ {end.strftime('%Y-%m-%d %H:%M')} "
+        "게시분 중 속보 표기·키워드 일치 기사(시간순)."
+    )
+    return picked[:max_items], note
 
 
 def collect_world_economy_section(
@@ -799,14 +848,20 @@ def collect_todays_economic_news(
     feed_urls: Sequence[str] | None = None,
     max_articles: int = 20,
     max_world_articles: int = 10,
+    max_overnight_breaking: int = 20,
     use_llm_summary: bool = True,
     use_listing_keywords: bool | None = None,
     include_world_macro: bool | None = None,
+    overnight_breaking: bool | None = None,
 ) -> Path:
     """
     주가·증시 키워드 뉴스 RSS를 받아 data/news_YYYYMMDD.txt 로 저장합니다.
     기본은 속보 검색·한국 상위 스토리·증시 검색 피드를 합친 뒤 최대 max_articles건만 남깁니다.
     기본 피드 사용 시 같은 파일 하단에 **세계 경제·정치·거시(영문) Top 10** 섹션을 이어 붙입니다.
+
+    추가로, KST 전날 23:00~당일 05:00 구간의 속보(키워드 일치)가 있으면
+    data/news_overnight_breaking_YYYYMMDD.txt 에 별도 저장합니다(overnight_breaking=False 또는
+    환경변수 NEWS_OVERNIGHT_BREAKING=0 이면 생략).
     """
     data_path = Path(data_dir)
     data_path.mkdir(parents=True, exist_ok=True)
@@ -822,6 +877,13 @@ def collect_todays_economic_news(
 
     if include_world_macro is None:
         include_world_macro = os.getenv("NEWS_INCLUDE_WORLD_MACRO", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+        )
+
+    if overnight_breaking is None:
+        overnight_breaking = os.getenv("NEWS_OVERNIGHT_BREAKING", "1").strip().lower() not in (
             "0",
             "false",
             "no",
@@ -880,6 +942,33 @@ def collect_todays_economic_news(
             body = body.rstrip() + "\n\n" + world_body.strip() + "\n"
 
     out_file.write_text(body, encoding="utf-8")
+
+    if overnight_breaking and max_overnight_breaking > 0:
+        ow_items, ow_note = select_overnight_breaking_items(
+            raw_items,
+            run_day_kst=now_kst.date(),
+            primary_keywords=primary_kw,
+            max_items=max_overnight_breaking,
+        )
+        if ow_items:
+            ow_start, ow_end = _overnight_breaking_window_kst(now_kst.date())
+            ow_source = (
+                "수집: 당일 일반 뉴스와 동일 RSS 병합본에서 선별. "
+                f"구간 KST {ow_start.strftime('%Y-%m-%d %H:%M')} ~ {ow_end.strftime('%Y-%m-%d %H:%M')}, "
+                "제목·요약에 속보 표기 + 주가·증시 키워드 일치분만."
+            )
+            ow_file = data_path / f"news_overnight_breaking_{date_tag}.txt"
+            ow_body = build_document_text(
+                ow_items,
+                source_note=ow_source,
+                collected_at_kst=now_kst,
+                note=ow_note,
+                use_llm_summary=use_llm_summary,
+                document_title="=== 전날 야간~새벽 속보 (23:00~05:00 KST) ===",
+            )
+            ow_file.write_text(ow_body, encoding="utf-8")
+            print(f"야간·새벽 속보 별도 저장: {ow_file.resolve()}")
+
     return out_file
 
 
@@ -924,6 +1013,17 @@ def main() -> None:
         action="store_true",
         help="같은 파일 하단의 세계 경제(영문) 섹션을 생략합니다.",
     )
+    parser.add_argument(
+        "--no-overnight-breaking",
+        action="store_true",
+        help="전날 23:00~당일 05:00(KST) 속보 별도 파일(news_overnight_breaking_*.txt)을 만들지 않습니다.",
+    )
+    parser.add_argument(
+        "--max-overnight-breaking",
+        type=int,
+        default=20,
+        help="야간·새벽 속보 파일에 넣을 최대 기사 수(기본 20).",
+    )
     args = parser.parse_args()
 
     path = collect_todays_economic_news(
@@ -931,9 +1031,11 @@ def main() -> None:
         feed_url=args.feed_url,
         max_articles=args.max_articles,
         max_world_articles=args.max_world_articles,
+        max_overnight_breaking=args.max_overnight_breaking,
         use_llm_summary=not args.no_llm_summary,
         use_listing_keywords=not args.no_listing_keywords,
         include_world_macro=not args.no_world_macro,
+        overnight_breaking=not args.no_overnight_breaking,
     )
     print(f"저장 완료: {path.resolve()}")
 

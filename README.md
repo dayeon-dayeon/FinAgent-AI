@@ -17,7 +17,7 @@
 - 고품질 Prompt : 역할 기반 프롬프트(Role-playing)와 Chain of Thought(CoT)를 적용하여 논리적이고 일관된 응답.
 - 결과물 구조화 : 최종 투자 전략을 정형화된 데이터 형식으로 응답.
 - 완결성 있는 서비스 패키징: FastAPI(백엔드)와 Streamlit(프론트엔드)을 활용하여 실제 사용 가능한 형태의 서비스.
-  => RAG 기반 뉴스 검색과 yfinance API 연동을 통한 종목별 1개월 주가 자동 데이터 수집. 데이터를 분석 후 추천까지 3단계로 Multi-Agent가 관리.
+  => RAG 기반 뉴스 검색과 Yahoo Finance 연동 종목별 주가(기간은 환경 변수로 설정) 자동 수집. 데이터를 분석 후 추천까지 3단계로 Multi-Agent가 관리.
 
 ## 3. 시스템 아키텍처
 
@@ -25,79 +25,108 @@
 
 ## 5. 프로젝트 구조
 
-# 실행 방법
+## 실행 방법
 
-## 1. 가상환경 생성 및 활성화
+아래 순서는 **처음 세팅** 기준입니다. 이미 가상환경과 패키지가 있으면 3번(환경 변수)부터 진행하면 됩니다.
 
-<pre>
-  python -m venv venv
-</pre>
+### 1. 가상환경 생성 및 활성화
 
-Windows의 경우:
+```bash
+python -m venv venv
+```
 
-<pre>
-venv\Scripts\activate
-</pre>
+- **Windows:** `venv\Scripts\activate`
+- **macOS / Linux:** `source venv/bin/activate`  
+  (프롬프트 앞에 `(venv)`가 보이면 활성화된 상태입니다.)
 
-Mac/Linux의 경우:
+### 2. 필수 패키지 설치
 
-<pre>
-source venv/bin/activate
-</pre>
-
-## 2. 필수 패키지 설치
-
-<pre>
+```bash
 pip install -r requirements.txt
-</pre>
+```
 
-<pre>
-#초기 세팅 또는 data폴더 내 변경사항 있으면
-pip install langchain-community langchain-text-splitters
-</pre>
+`requirements.txt`에 없는 모듈 오류가 나면 메시지에 맞춰 추가 설치하면 됩니다. (예: `langchain-community`, `langchain-text-splitters`는 보통 위 파일에 포함됩니다.)
 
-(※ 만약 requirements.txt가 없다면: pip install langchain langchain-openai langgraph streamlit fastapi uvicorn yfinance pandas faiss-cpu 등 설치 필요.)
+### 3. 환경 변수 (`.env`)
 
-## 3. 환경 변수 설정
+프로젝트 **루트**에 `.env` 파일을 두고, 최소한 아래를 설정합니다.
 
-LLM(OpenAI)을 사용하기 위해 API Key 설정이 필요합니다.
-프로젝트 최상단 루트 디렉토리에 .env 파일을 생성합니다.
+| 변수                   | 필수 | 설명                                                                   |
+| ---------------------- | ---- | ---------------------------------------------------------------------- |
+| `OPENAI_API_KEY`       | 권장 | LLM·임베딩·뉴스 요약(`rag/economic_news.py`)에 사용                    |
+| `STOCK_CHART_PERIOD`   | 선택 | Yahoo Finance 주가 조회 기간. 예: `1mo`(기본), `3mo`, `6mo`, `1y`      |
+| `NEWS_INCLUDE_LISTING` | 선택 | `0`이면 뉴스 키워드에서 코스피·코스닥·나스닥 종목명 매칭 제외          |
+| `BACKEND_URL`          | 선택 | Streamlit이 호출할 API 주소. 미설정 시 `http://localhost:8000/analyze` |
+| `DATA_PATH`            | 선택 | 데이터·캐시 기본 폴더. 미설정 시 `data`                                |
+| `NEWS_SUMMARY_MODEL`   | 선택 | 뉴스 요약용 OpenAI 모델. 기본 `gpt-4o-mini`                            |
 
-<pre>
-OPENAI_API_KEY="키입력"
-</pre>
+예시:
 
-## 4. Vector DB 초기화
+```env
+OPENAI_API_KEY=sk-...
+STOCK_CHART_PERIOD=3mo
+```
 
-에이전트가 참고할 금융 리포트 및 뉴스 데이터를 FAISS Vector DB로 임베딩합니다.
-분석하고자 하는 텍스트 파일(.txt)들을 data/ 폴더 내부에 위치시킵니다.
+### 4. (선택) 오늘의 경제·증시 뉴스 수집
 
-<pre>
-# FAISS Vector DB 생성 스크립트 실행
+`data/news_YYYYMMDD.txt` 형태로 저장되며, RAG에 넣을 `.txt` 자료로 쓸 수 있습니다. (요약은 API 키가 있을 때 400~500자 생성.)
+
+```bash
+python -m rag.economic_news
+```
+
+자주 쓰는 옵션:
+
+- `--max-articles 10` — 저장할 기사 수 (기본 10)
+- `--no-llm-summary` — OpenAI 없이 RSS만 묶기
+- `--no-listing-keywords` — 종목명 키워드 확장 없이 고정 키워드만 사용
+
+상장 종목명 캐시만 갱신할 때:
+
+```bash
+python -m rag.stock_universe
+```
+
+### 5. Vector DB (FAISS) 초기화
+
+`data/` 아래 분석에 쓸 `.txt` / `.pdf` / `.csv`를 두고, 내용이 바뀌었거나 처음이면 인덱스를 다시 만듭니다.
+
+```bash
 python rag/vector_store.py
-</pre>
+```
 
-## 5. 서비스 실행
+### 6. 서비스 실행
 
-본 서비스는 백엔드 API 서버(FastAPI)와 프론트엔드 사용자 인터페이스(Streamlit)를 동시에 구동해야 합니다.
-터미널 창을 2개 열어서 각각 실행해 주세요.
+백엔드(FastAPI)와 프론트(Streamlit)를 **동시에** 띄워야 합니다.
 
-터미널 1: FastAPI 백엔드 서버 실행
+**방법 A — 터미널 두 개**
 
-<pre>
+터미널 1 (API):
+
+```bash
 uvicorn main:app --reload --port 8000
-</pre>
+```
 
-터미널 2: Streamlit 사용자 UI 실행
+터미널 2 (UI):
 
-<pre>
+```bash
 streamlit run app.py
-</pre>
+```
 
----
+브라우저에서 Streamlit 주소(보통 `http://localhost:8501`)로 접속합니다. API만 확인할 때는 `http://localhost:8000/health` 로 헬스 체크가 가능합니다.
 
-<pre>
-python run.py 
-</pre>
+**방법 B — 한 번에 실행 (Windows 등)**
 
-python rag/vector_store.py
+```bash
+python run.py
+```
+
+백엔드와 Streamlit을 같이 띄우고 브라우저를 엽니다. 종료는 해당 터미널에서 `Ctrl+C`입니다.
+
+### 7. 동작 요약
+
+1. **수집가** — RAG(`data/` 기반 FAISS), 질문에 맞는 **최근 주가**(Yahoo), **웹 검색**(DuckDuckGo)을 모읍니다.
+2. **분석가** — 위 컨텍스트만으로 리포트를 작성합니다.
+3. **매니저** — 원문 컨텍스트와 리포트를 대조해 JSON 형태의 투자 의견을 냅니다.
+
+주가 기간·뉴스 범위에는 위 한계가 있으므로, 중요한 의사결정은 반드시 원문 공시·거래소 정보와 함께 검증하세요.
