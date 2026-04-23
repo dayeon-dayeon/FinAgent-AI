@@ -6,7 +6,7 @@ FinAgent-AI 통합 실행 스크립트.
 
 단계:
   1) pip install -r requirements.txt
-  2) python -m rag.economic_news  (오늘자 data/news_YYYYMMDD.txt 수집)
+  2) python -m rag.economic_news  (오늘 파일이 없을 때만 자동 수집; 이미 있으면 건너뜀 → 재수집은 Streamlit 또는 --news-force)
   3) python -m rag.vector_store   (data/ 기반 FAISS 인덱스 생성)
   4) FastAPI(8000) + Streamlit(8501) 동시 기동
 
@@ -18,20 +18,38 @@ FinAgent-AI 통합 실행 스크립트.
     python run.py --no-news
     python run.py --no-faiss
 
+뉴스 강제 수집(터미널):
+    python run.py --news-force          # 오늘 파일이 있어도 RSS·요약 전체 다시 실행
+
 가상환경 사용 시 프로젝트 루트에서 venv 활성화 후 실행하는 것을 권장합니다.
 """
 from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 import subprocess
 import sys
 import time
 import webbrowser
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 REQUIREMENTS = ROOT / "requirements.txt"
+_KST = timezone(timedelta(hours=9))
+
+
+def _news_data_dir() -> Path:
+    raw = os.getenv("DATA_PATH", "data")
+    p = Path(raw)
+    return p.resolve() if p.is_absolute() else (ROOT / p).resolve()
+
+
+def _todays_news_file_path() -> Path:
+    """economic_news.py 와 동일: KST 기준 news_YYYYMMDD.txt"""
+    tag = datetime.now(_KST).strftime("%Y%m%d")
+    return _news_data_dir() / f"news_{tag}.txt"
 
 
 def _run_step(
@@ -77,7 +95,29 @@ def step_pip_install() -> bool:
     )
 
 
-def step_economic_news() -> bool:
+def _should_run_news_collection(*, force: bool) -> bool:
+    """
+    True 이면 rag.economic_news 를 실행한다.
+    오늘 파일이 이미 있으면 기본은 건너뜀(재수집은 Streamlit UI 또는 --news-force).
+    """
+    path = _todays_news_file_path()
+    if not path.is_file() or path.stat().st_size == 0:
+        return True
+
+    if force:
+        print(f"\n[뉴스] --news-force: 기존 파일을 덮어쓰며 다시 수집합니다.\n  {path}")
+        return True
+
+    print(
+        f"\n[건너뜀] 오늘 뉴스 파일이 이미 있습니다. (빠른 기동)\n  {path.resolve()}\n"
+        "  다시 수집: 웹 화면 「오늘 뉴스 수집」에서 실행, 또는 터미널에서 python run.py --news-force"
+    )
+    return False
+
+
+def step_economic_news(*, force: bool = False) -> bool:
+    if not _should_run_news_collection(force=force):
+        return True
     return _run_step(
         "[2/4] 오늘의 경제·증시 뉴스 수집 (python -m rag.economic_news)",
         [sys.executable, "-m", "rag.economic_news"],
@@ -164,6 +204,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-pip", action="store_true", help="pip 설치 단계를 건너뜁니다.")
     p.add_argument("--no-news", action="store_true", help="뉴스 수집 단계를 건너뜁니다.")
     p.add_argument("--no-faiss", action="store_true", help="FAISS 초기화 단계를 건너뜁니다.")
+    p.add_argument(
+        "--news-force",
+        action="store_true",
+        help="오늘 news_YYYYMMDD.txt 가 있어도 뉴스 수집을 다시 실행합니다.",
+    )
     return p.parse_args()
 
 
@@ -184,7 +229,7 @@ def main() -> None:
         print("\n[건너뜀] pip 설치 (--no-pip)")
 
     if not args.no_news:
-        step_economic_news()
+        step_economic_news(force=args.news_force)
     else:
         print("\n[건너뜀] 뉴스 수집 (--no-news)")
 

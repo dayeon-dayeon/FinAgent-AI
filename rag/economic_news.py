@@ -1,6 +1,7 @@
 """
 오늘(한국 표준시) 기준, 주가·증시 관련 키워드가 포함된 뉴스를 RSS로 수집해 data/ 디렉터리에 저장합니다.
 기본 설정에서는 같은 파일(`news_YYYYMMDD.txt`) 하단에 **세계 경제·정치·거시(영문 Google News) Top 10**을 이어 붙입니다.
+**월요일(KST)** 에 수집을 돌리면 직전 **토·일** 게시분만 모은 `news_weekend_YYYYMMDD.txt`(YYYYMMDD=그 월요일)도 추가로 만듭니다.
 vector_store.py는 파일명의 날짜와 'news' 등 키워드로 메타데이터를 구분할 수 있습니다.
 """
 
@@ -739,6 +740,53 @@ def _article_dedupe_key(it: dict[str, str | None]) -> str:
     return f"title:{_clean_html(str(it.get('title') or ''))}"
 
 
+def _weekend_dates_before_monday(monday_d: date) -> tuple[date, date]:
+    """monday_d(월요일, KST 날짜) 직전 토요일·일요일 날짜."""
+    sunday = monday_d - timedelta(days=1)
+    saturday = monday_d - timedelta(days=2)
+    return saturday, sunday
+
+
+def select_weekend_keyword_items(
+    raw_items: list[dict[str, str | None]],
+    *,
+    monday_d: date,
+    primary_keywords: tuple[str, ...],
+    max_items: int,
+) -> tuple[list[dict[str, str | None]], str | None]:
+    """
+    동일 RSS 병합본에서, 게시 시각(KST 날짜)이 직전 주말(토·일)이면서
+    primary_keywords에 맞는 기사만 최신순으로 고릅니다.
+    """
+    sat_d, sun_d = _weekend_dates_before_monday(monday_d)
+    keyword_items = [it for it in raw_items if item_matches_keywords(it, primary=primary_keywords)]
+    picked: list[dict[str, str | None]] = []
+    seen: set[str] = set()
+    for it in keyword_items:
+        dt = _parse_pub_date(it.get("pubDate") if isinstance(it.get("pubDate"), str) else None)
+        if dt is None:
+            continue
+        d_kst = dt.astimezone(KST).date()
+        if d_kst not in (sat_d, sun_d):
+            continue
+        key = _article_dedupe_key(it)
+        if key in seen:
+            continue
+        seen.add(key)
+        picked.append(it)
+    picked.sort(key=lambda it: -_item_pub_ts(it))
+    if not picked:
+        return [], (
+            f"직전 주말 {sat_d.isoformat()}·{sun_d.isoformat()} (KST) "
+            "게시·키워드 일치 기사가 없습니다."
+        )
+    note = (
+        f"직전 주말 {sat_d.isoformat()}·{sun_d.isoformat()} (KST) 게시분, "
+        f"최대 {max_items}건·최신순."
+    )
+    return picked[:max_items], note
+
+
 def _overnight_breaking_window_kst(run_day: date) -> tuple[datetime, datetime]:
     """장 전 새벽 묶음: 전날 23:00(KST) 이상 ~ 당일 05:00(KST) 미만."""
     prev = run_day - timedelta(days=1)
@@ -853,6 +901,8 @@ def collect_todays_economic_news(
     use_listing_keywords: bool | None = None,
     include_world_macro: bool | None = None,
     overnight_breaking: bool | None = None,
+    weekend_pack: bool | None = None,
+    max_weekend_articles: int = 30,
 ) -> Path:
     """
     주가·증시 키워드 뉴스 RSS를 받아 data/news_YYYYMMDD.txt 로 저장합니다.
@@ -862,6 +912,9 @@ def collect_todays_economic_news(
     추가로, KST 전날 23:00~당일 05:00 구간의 속보(키워드 일치)가 있으면
     data/news_overnight_breaking_YYYYMMDD.txt 에 별도 저장합니다(overnight_breaking=False 또는
     환경변수 NEWS_OVERNIGHT_BREAKING=0 이면 생략).
+
+    **월요일(KST)** 이고 기본 피드 사용 시, 직전 토·일 게시분을 data/news_weekend_YYYYMMDD.txt
+    (YYYYMMDD=그 월요일)에 별도 저장합니다(weekend_pack=False 또는 NEWS_WEEKEND_PACK=0 이면 생략).
     """
     data_path = Path(data_dir)
     data_path.mkdir(parents=True, exist_ok=True)
@@ -884,6 +937,13 @@ def collect_todays_economic_news(
 
     if overnight_breaking is None:
         overnight_breaking = os.getenv("NEWS_OVERNIGHT_BREAKING", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+        )
+
+    if weekend_pack is None:
+        weekend_pack = os.getenv("NEWS_WEEKEND_PACK", "1").strip().lower() not in (
             "0",
             "false",
             "no",
@@ -969,6 +1029,36 @@ def collect_todays_economic_news(
             ow_file.write_text(ow_body, encoding="utf-8")
             print(f"야간·새벽 속보 별도 저장: {ow_file.resolve()}")
 
+    if (
+        weekend_pack
+        and use_default_bundle
+        and now_kst.weekday() == 0
+        and max_weekend_articles > 0
+    ):
+        w_items, w_note = select_weekend_keyword_items(
+            raw_items,
+            monday_d=now_kst.date(),
+            primary_keywords=primary_kw,
+            max_items=max_weekend_articles,
+        )
+        if w_items:
+            sat_d, sun_d = _weekend_dates_before_monday(now_kst.date())
+            w_source = (
+                "수집: 당일 일반 뉴스와 동일 RSS 병합본에서 선별. "
+                f"게시일(KST)이 직전 주말 {sat_d.isoformat()}(토)·{sun_d.isoformat()}(일)인 기사만."
+            )
+            w_file = data_path / f"news_weekend_{date_tag}.txt"
+            w_body = build_document_text(
+                w_items,
+                source_note=w_source,
+                collected_at_kst=now_kst,
+                note=w_note,
+                use_llm_summary=use_llm_summary,
+                document_title="=== 직전 주말 주가·증시 키워드 뉴스 (토·일, KST) ===",
+            )
+            w_file.write_text(w_body, encoding="utf-8")
+            print(f"주말 묶음 별도 저장: {w_file.resolve()}")
+
     return out_file
 
 
@@ -1024,6 +1114,17 @@ def main() -> None:
         default=20,
         help="야간·새벽 속보 파일에 넣을 최대 기사 수(기본 20).",
     )
+    parser.add_argument(
+        "--no-weekend-pack",
+        action="store_true",
+        help="월요일에도 직전 주말 묶음 파일(news_weekend_*.txt)을 만들지 않습니다.",
+    )
+    parser.add_argument(
+        "--max-weekend-articles",
+        type=int,
+        default=30,
+        help="주말 묶음 파일에 넣을 최대 기사 수(기본 30, 월요일만 생성).",
+    )
     args = parser.parse_args()
 
     path = collect_todays_economic_news(
@@ -1032,10 +1133,12 @@ def main() -> None:
         max_articles=args.max_articles,
         max_world_articles=args.max_world_articles,
         max_overnight_breaking=args.max_overnight_breaking,
+        max_weekend_articles=args.max_weekend_articles,
         use_llm_summary=not args.no_llm_summary,
         use_listing_keywords=not args.no_listing_keywords,
         include_world_macro=not args.no_world_macro,
         overnight_breaking=not args.no_overnight_breaking,
+        weekend_pack=not args.no_weekend_pack,
     )
     print(f"저장 완료: {path.resolve()}")
 

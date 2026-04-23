@@ -15,7 +15,7 @@ from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
 from langchain_community.tools import DuckDuckGoSearchResults
 
-from agent.prompts import ANALYST_PROMPT, MANAGER_PROMPT
+from agent.prompts import ALTERNATIVE_ADVISOR_PROMPT, ANALYST_PROMPT, MANAGER_PROMPT
 from agent.state import AgentState
 from rag.vector_store import get_retriever
 
@@ -301,6 +301,29 @@ def _read_todays_news_file() -> tuple[str, str] | None:
     return (ap, text.strip())
 
 
+def _read_monday_weekend_news_file() -> tuple[str, str] | None:
+    """KST 월요일이면 data/news_weekend_YYYYMMDD.txt(그 월요일 날짜 태그)가 있으면 (절대경로, 본문) 반환."""
+    now = datetime.now(KST)
+    if now.weekday() != 0:
+        return None
+    tag = now.strftime("%Y%m%d")
+    path = os.path.join(_data_dir(), f"news_weekend_{tag}.txt")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError as e:
+        print(f"주말 뉴스 파일 읽기 실패 ({path}): {e}")
+        return None
+    if not text.strip():
+        return None
+    ap = os.path.abspath(path)
+    if len(text) > _MAX_NEWS_INJECT_CHARS:
+        text = text[:_MAX_NEWS_INJECT_CHARS] + "\n...(이하 생략)"
+    return (ap, text.strip())
+
+
 def _parse_date_from_source(source: str) -> date | None:
     basename = os.path.basename(source)
     match = re.search(r"(\d{8}|\d{6})", basename)
@@ -342,6 +365,7 @@ def collector_node(state: AgentState) -> AgentState:
             summary_lines.append(f"- **주가 수집**: {', '.join(names)} (Yahoo Finance)")
 
     today_news_basename: str | None = None
+    weekend_news_basename: str | None = None
     use_todays_news_file_only = False
     injected = _read_todays_news_file()
     if injected:
@@ -358,6 +382,17 @@ def collector_node(state: AgentState) -> AgentState:
             )
             use_todays_news_file_only = True
 
+    weekend_injected = _read_monday_weekend_news_file()
+    if weekend_injected:
+        wpath, wtext = weekend_injected
+        weekend_news_basename = os.path.basename(wpath)
+        filtered_w = _filter_daily_news_by_query(wtext, q, detected_tickers)
+        wbody = filtered_w.strip() if filtered_w.strip() else wtext.strip()
+        print(f"▶ [직전 주말 뉴스] {weekend_news_basename} — 토·일(KST) 키워드 뉴스를 근거에 추가")
+        context_list.append(f"[출처: {wpath}]\n{wbody}")
+        collected_sources.append(wpath)
+        summary_lines.append(f"- **직전 주말 뉴스**: `{weekend_news_basename}`")
+
     if not use_todays_news_file_only:
         try:
             retriever = get_retriever()
@@ -368,13 +403,15 @@ def collector_node(state: AgentState) -> AgentState:
                 scored_docs = []
                 for doc in docs:
                     source_file = doc.metadata.get("source", "알 수 없는 파일")
-                    if today_news_basename and os.path.basename(source_file) == today_news_basename:
+                    bname = os.path.basename(source_file)
+                    if today_news_basename and bname == today_news_basename:
+                        continue
+                    if weekend_news_basename and bname == weekend_news_basename:
                         continue
 
                     doc_date = _parse_date_from_source(source_file)
                     content = doc.page_content.strip()
-                    base_name = os.path.basename(source_file)
-                    is_daily_news_doc = doc.metadata.get("doc_type") == "news" or base_name.lower().startswith(
+                    is_daily_news_doc = doc.metadata.get("doc_type") == "news" or bname.lower().startswith(
                         "news_"
                     )
 
@@ -506,3 +543,31 @@ def manager_node(state: AgentState) -> AgentState:
         }
     )
     return {"final_result": response.content}
+
+
+def alternative_advisor_node(state: AgentState) -> AgentState:
+    """뉴스·맥락을 바탕으로 ETF·리츠·금 등 개별 주식 외 대안을 제안합니다(매니저와 독립 역할)."""
+    print("[Agent 4] 대안 자산·ETF 자문가")
+    today_date = datetime.now().strftime("%Y년 %m월 %d일")
+    ctx = state.get("context") or ""
+    if len(ctx) > 14000:
+        ctx = ctx[:13900] + "\n\n[… 이하 컨텍스트 생략 …]"
+
+    mgr = state.get("final_result", "{}")
+    if isinstance(mgr, dict):
+        mgr_text = json.dumps(mgr, ensure_ascii=False)
+    else:
+        mgr_text = str(mgr)
+
+    prompt = PromptTemplate.from_template(ALTERNATIVE_ADVISOR_PROMPT)
+    chain = prompt | llm
+    response = chain.invoke(
+        {
+            "query": state["query"],
+            "context": ctx,
+            "analysis": state.get("analysis") or "",
+            "manager_output": mgr_text,
+            "current_date": today_date,
+        }
+    )
+    return {"alternative_advice": response.content}

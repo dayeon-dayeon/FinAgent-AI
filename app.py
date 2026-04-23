@@ -1,14 +1,19 @@
 import os
-import re          
-import pandas as pd
+import re
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
 import altair as alt
+import pandas as pd
 import requests
 import streamlit as st
+
+_KST = timezone(timedelta(hours=9))
 
 st.set_page_config(page_title="FinAgent-AI", page_icon="📈", layout="wide")
 
 st.title("📈 AI 주가 분석 & 포트폴리오 에이전트 📈")
-st.markdown("3명의 AI 에이전트가 데이터를 분석하여 투자 전략을 제시합니다.")
+st.markdown("4명의 AI 에이전트가 데이터를 분석하고, 투자 전략을 제시합니다.")
 
 # 환경 변수 / secrets 기반 백엔드 URL 설정
 default_backend = "http://localhost:8000/analyze"
@@ -22,8 +27,61 @@ except Exception:
 
 BACKEND_URL = backend_from_secrets or backend_from_env or default_backend
 
+
+def _api_base() -> str:
+    u = BACKEND_URL.rstrip("/")
+    if u.endswith("/analyze"):
+        return u[: -len("/analyze")]
+    return u
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _today_news_path() -> Path:
+    tag = datetime.now(_KST).strftime("%Y%m%d")
+    raw = os.getenv("DATA_PATH", "data")
+    p = Path(raw)
+    if not p.is_absolute():
+        p = _project_root() / p
+    return p / f"news_{tag}.txt"
+
+
 if "history" not in st.session_state:
     st.session_state["history"] = []
+
+with st.expander("📰 오늘 뉴스 재수집 ", expanded=False):
+    np = _today_news_path()
+    exists = np.is_file() and np.stat().st_size > 0
+    if exists:
+        st.success(f"오늘 뉴스 파일이 있습니다: `{np.name}`")
+        st.caption(f"경로: `{np}` — **기존 파일로 분석**하려면 아래에서 질문만 입력하면 됩니다.")
+    else:
+        st.warning("오늘 뉴스 파일이 없습니다. `run.py`로 수집했거나 여기서 수집을 실행하세요.")
+
+    rebuild_faiss = st.checkbox(
+        "수집 후 FAISS 인덱스도 다시 만들기 (임베딩·시간 추가 소요)",
+        value=False,
+    )
+    if st.button(
+        "RSS에서 다시 수집하기" if exists else "뉴스 수집 실행하기",
+        type="primary",
+        help="백엔드 `POST /collect-news` 를 호출합니다.",
+    ):
+        try:
+            with st.spinner("뉴스 수집 중… 완료될 때까지 창을 닫지 마세요."):
+                resp = requests.post(
+                    f"{_api_base()}/collect-news",
+                    json={"rebuild_faiss": rebuild_faiss},
+                    timeout=900,
+                )
+            if resp.status_code == 200:
+                st.success(resp.json())
+            else:
+                st.error(f"{resp.status_code}: {resp.text}")
+        except requests.RequestException as e:
+            st.error(f"백엔드 요청 실패: {e}")
 
 query = st.text_input(
     "관심 있는 기업이나 최근 경제 이슈에 대해 질문해 보세요. (ex :  최근 삼성전자 D램 이슈와 주가 전망 알려줘 / SK하이닉스의 1개월치 주가 데이터와 최근 이슈 분석해)"
@@ -31,7 +89,7 @@ query = st.text_input(
 
 if st.button("분석 시작"):
     if query:
-        with st.spinner("AI 에이전트(수집가, 분석가, 매니저)들이 열심히 분석 중입니다... 🤖"):
+        with st.spinner("AI 에이전트(수집가, 분석가, 매니저, 대안자산)가 분석 중입니다... 🤖"):
             try:
                 response = requests.post(BACKEND_URL, json={"query": query})
 
@@ -108,6 +166,14 @@ if st.button("분석 시작"):
                     if "💡 시기적 심리 변수 (주의사항)" in strategy:
                         st.warning(f"**주의사항:** {strategy.get('💡 시기적 심리 변수 (주의사항)')}")
 
+                    st.divider()
+                    st.subheader("🏛️ [Agent 4] 대안 자산·ETF 자문")
+                    alt = data.get("alternative_advice")
+                    if alt:
+                        st.markdown(alt)
+                    else:
+                        st.caption("이번 응답에는 대안 자산 제안이 포함되지 않았습니다.")
+
                     # 간단한 히스토리 저장
                     st.session_state["history"].append(
                         {
@@ -115,6 +181,7 @@ if st.button("분석 시작"):
                             "collector": data["collector"],
                             "analysis": data["analysis"],
                             "strategy": strategy,
+                            "alternative_advice": data.get("alternative_advice"),
                         }
                     )
                 else:
@@ -145,3 +212,6 @@ if st.session_state["history"]:
             st.markdown("---")
             st.markdown("**[Agent 3] 포트폴리오 매니저 전략**")
             st.markdown(item["strategy"])
+            st.markdown("---")
+            st.markdown("**[Agent 4] 대안 자산·ETF**")
+            st.markdown(item.get("alternative_advice") or "(없음)")

@@ -1,5 +1,5 @@
 from langgraph.graph import StateGraph, END
-from .nodes import collector_node, analyst_node, manager_node
+from .nodes import collector_node, analyst_node, manager_node, alternative_advisor_node
 from .state import AgentState
 
 def should_continue(state: AgentState):
@@ -13,6 +13,7 @@ def build_graph():
     workflow.add_node("collector", collector_node)
     workflow.add_node("analyst", analyst_node)
     workflow.add_node("manager", manager_node)
+    workflow.add_node("alternative_advisor", alternative_advisor_node)
 
     workflow.set_entry_point("collector")
     
@@ -26,6 +27,7 @@ def build_graph():
     )
     
     workflow.add_edge("analyst", "manager")
-    workflow.add_edge("manager", END)
+    workflow.add_edge("manager", "alternative_advisor")
+    workflow.add_edge("alternative_advisor", END)
 
     return workflow.compile()

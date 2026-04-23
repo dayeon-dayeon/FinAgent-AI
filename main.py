@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
 import json
+import os
 
 app = FastAPI()
 
@@ -26,6 +27,11 @@ class AnalysisResponse(BaseModel):
     analysis: str
     strategy: Dict[str, Any]
     stock_chart: Optional[List[Dict[str, Any]]] = None
+    alternative_advice: Optional[str] = None
+
+
+class CollectNewsBody(BaseModel):
+    rebuild_faiss: bool = False
 
 
 def _normalize_strategy_keys(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -72,6 +78,7 @@ async def analyze(request: QueryRequest):
                         "💡 시기적 심리 변수 (주의사항)": "해당 없음",
                     },
                     stock_chart=stock_chart,
+                    alternative_advice=None,
                 )
             raise HTTPException(status_code=422, detail=err)
 
@@ -94,6 +101,7 @@ async def analyze(request: QueryRequest):
             analysis=analysis_data,
             strategy=strategy_json,
             stock_chart=stock_chart if stock_chart else None,
+            alternative_advice=result.get("alternative_advice"),
         )
 
     except HTTPException:
@@ -101,6 +109,26 @@ async def analyze(request: QueryRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"에이전트 실행 중 오류 발생: {str(e)}")
+
+
+@app.post("/collect-news")
+def collect_news(body: CollectNewsBody = CollectNewsBody()):
+    """
+    Streamlit 등 UI에서 호출: 오늘자 news_YYYYMMDD.txt 를 RSS+요약으로 다시 생성.
+    rebuild_faiss=True 이면 data/ 기준 FAISS 인덱스도 재생성(시간·API 비용 증가).
+    """
+    try:
+        from rag.economic_news import collect_todays_economic_news
+        from rag.vector_store import create_vector_db
+
+        data_dir = os.getenv("DATA_PATH", "data")
+        out = collect_todays_economic_news(data_dir)
+        faiss_ok: bool | None = None
+        if body.rebuild_faiss:
+            faiss_ok = create_vector_db() is not None
+        return {"ok": True, "path": str(out.resolve()), "rebuild_faiss": faiss_ok}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":

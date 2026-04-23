@@ -14,6 +14,8 @@ class AgentState(TypedDict, total=False):
     detected_companies: List[str]
     """질문에서 감지된 회사명(표시용)."""
     analysis: str
+    alternative_advice: str
+    """Agent 4: ETF·리츠·금 등 비(非)개별주식 제안(마크다운)."""
     final_result: Union[str, dict]
     ticker: Optional[str]
     ticker_detected: bool
